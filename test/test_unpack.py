@@ -185,3 +185,23 @@ def test_unpack_raises_extra_data_on_stream_with_trailing_bytes():
         unpack(stream)
     assert exc_info.value.unpacked == 100
     assert exc_info.value.extra == packb(200)
+
+
+def test_unpack_raises_extra_data_for_bytes_read_ahead():
+    # The first object is small, so the trailing data is already buffered
+    # before the object is complete. It must still be reported in full.
+    stream = BytesIO(packb(100) + b"\xc0" * 200_000)
+    with raises(ExtraData) as exc_info:
+        unpack(stream)
+    assert exc_info.value.unpacked == 100
+    assert exc_info.value.extra == b"\xc0" * 200_000
+
+
+def test_unpack_empty_stream_is_incomplete_input():
+    with raises(ValueError):
+        unpack(BytesIO(b""))
+
+
+def test_unpack_incomplete_stream_is_incomplete_input():
+    with raises(ValueError):
+        unpack(BytesIO(packb([1, 2, 3])[:-1]))

@@ -266,18 +266,29 @@ class Unpacker:
             self.file_like = file_like
             self._feeding = False
 
-        #: array of bytes fed.
+        #: array of bytes fed or read from `file_like`.
         self._buffer = bytearray()
         #: Which position we currently reads
         self._buff_i = 0
-
+        #: Stream offset of `self._buffer[0]`.
+        self._buffer_start = 0
+        #: True once `file_like` returned no more data.
+        self._eof = False
+        #: Containers being built. Each frame is
+        #: [TYPE_ARRAY, size, count, obj] or
+        #: [TYPE_MAP, size, count, obj, map_key, expect_value].
+        self._stack = []
+        #: `EX_CONSTRUCT` or `EX_SKIP` while an object is incomplete.
+        self._active_execute = None
         # When Unpacker is used as an iterable, between the calls to next(),
         # the buffer is not "consumed" completely, for efficiency sake.
         # Instead, it is done sloppily.  To make sure we raise BufferFull at
         # the correct moments, we have to keep track of how sloppy we were.
         # Furthermore, when the buffer is incomplete (that is: in the case
         # we raise an OutOfData) we need to rollback the buffer to the correct
-        # state, which _buf_checkpoint records.
+        # state, which _buf_checkpoint records. The checkpoint always points at
+        # the first byte of the incomplete token, so only that token has to be
+        # kept in memory while more input is read.
         self._buf_checkpoint = 0
 
         if not max_buffer_size:
@@ -313,7 +324,6 @@ class Unpacker:
         self._max_array_len = max_array_len
         self._max_map_len = max_map_len
         self._max_ext_len = max_ext_len
-        self._stream_offset = 0
 
         if list_hook is not None and not callable(list_hook):
             raise TypeError("`list_hook` is not callable")
@@ -336,36 +346,56 @@ class Unpacker:
         if self._buf_checkpoint > 0:
             del self._buffer[: self._buf_checkpoint]
             self._buff_i -= self._buf_checkpoint
+            self._buffer_start += self._buf_checkpoint
             self._buf_checkpoint = 0
 
         # Use extend here: INPLACE_ADD += doesn't reliably typecast memoryview in jython
         self._buffer.extend(view if view.contiguous else view.tobytes())
         view.release()
 
+    def _trim(self):
+        """Release input that has been decoded already.
+
+        Only bytes before the checkpoint (the start of the incomplete token)
+        are needed to resume. When reading from a file, everything before the
+        current token can be dropped as soon as it has been consumed.
+        """
+        pending = self._buf_checkpoint
+        if pending:
+            del self._buffer[:pending]
+            self._buff_i -= pending
+            self._buffer_start += pending
+            self._buf_checkpoint = 0
+
     def _consume(self):
         """Gets rid of the used parts of the buffer."""
-        self._stream_offset += self._buff_i - self._buf_checkpoint
         self._buf_checkpoint = self._buff_i
+        if self._feeding:
+            # The caller's fed bytes are kept until the next feed() so that
+            # unpackb() can report them as ExtraData.
+            return
+        self._trim()
 
     def _got_extradata(self):
         return self._buff_i < len(self._buffer)
 
     def _get_extradata(self):
-        return self._buffer[self._buff_i :]
+        return bytes(self._buffer[self._buff_i :])
 
     def read_bytes(self, n):
         if n < 0:
             raise ValueError("nbytes must be non-negative")
+        self._buf_checkpoint = self._buff_i
         ret = self._read(n, raise_outofdata=False)
         self._consume()
         # The C extension returns bytes. A bytearray slice cannot be a dict key.
         return bytes(ret)
 
     def _read(self, n, raise_outofdata=True):
-        # (int) -> bytearray
+        # (int) -> bytes
         self._reserve(n, raise_outofdata=raise_outofdata)
         i = self._buff_i
-        ret = self._buffer[i : i + n]
+        ret = bytes(memoryview(self._buffer)[i : i + n])
         self._buff_i = i + len(ret)
         return ret
 
@@ -380,30 +410,42 @@ class Unpacker:
             self._buff_i = self._buf_checkpoint
             raise OutOfData
 
-        # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
+        # Reading from a file: drop input that is no longer needed, then read
+        # more. A single read() is not required to return all requested bytes.
+        self._trim()
+        remain_bytes = len(self._buffer) - self._buff_i - n
+        if remain_bytes < 0 and not self._eof:
+            needed = -remain_bytes
+            if n + self._buff_i > self._max_buffer_size:
+                raise BufferFull
+            while needed > 0:
+                to_read_bytes = max(self._read_size, needed)
+                read_data = self.file_like.read(to_read_bytes)
+                if not read_data:
+                    self._eof = True
+                    break
+                # A single read() may return fewer bytes than requested, and
+                # may return any bytes-like object.
+                view = _get_data_from_buffer(read_data)
+                try:
+                    if view.contiguous:
+                        self._buffer += view
+                    else:
+                        self._buffer += view.tobytes()
+                finally:
+                    view.release()
+                needed -= len(read_data)
+            remain_bytes = len(self._buffer) - self._buff_i - n
 
-        # Read from file
-        remain_bytes = -remain_bytes
-        if remain_bytes + len(self._buffer) > self._max_buffer_size:
-            raise BufferFull
-        while remain_bytes > 0:
-            to_read_bytes = max(self._read_size, remain_bytes)
-            read_data = self.file_like.read(to_read_bytes)
-            if not read_data:
-                break
-            assert isinstance(read_data, bytes)
-            self._buffer += read_data
-            remain_bytes -= len(read_data)
-
-        if len(self._buffer) < n + self._buff_i and raise_outofdata:
-            self._buff_i = 0  # rollback
+        if remain_bytes < 0 and raise_outofdata:
+            # Restart this token when more input arrives.
+            self._buff_i = self._buf_checkpoint
             raise OutOfData
 
     def _read_header(self):
+        # Anything before the token that starts here can be released if the
+        # token turns out to be incomplete.
+        self._buf_checkpoint = self._buff_i
         typ = TYPE_IMMEDIATE
         n = 0
         obj = None
@@ -499,71 +541,11 @@ class Unpacker:
             raise FormatError("Unknown header: 0x%x" % b)
         return typ, n, obj
 
-    def _unpack(self, execute=EX_CONSTRUCT):
-        typ, n, obj = self._read_header()
-
-        if execute == EX_READ_ARRAY_HEADER:
-            if typ != TYPE_ARRAY:
-                # Leave the object unread, as the C extension does.
-                self._buff_i = self._buf_checkpoint
-                raise ValueError("Expected array")
-            return n
-        if execute == EX_READ_MAP_HEADER:
-            if typ != TYPE_MAP:
-                self._buff_i = self._buf_checkpoint
-                raise ValueError("Expected map")
-            return n
-        # TODO should we eliminate the recursion?
-        if typ == TYPE_ARRAY:
-            if execute == EX_SKIP:
-                for i in range(n):
-                    # TODO check whether we need to call `list_hook`
-                    self._unpack(EX_SKIP)
-                return
-            ret = newlist_hint(min(n, 10000))
-            for i in range(n):
-                ret.append(self._unpack(EX_CONSTRUCT))
-            if self._list_hook is not None:
-                ret = self._list_hook(ret)
-            # TODO is the interaction between `list_hook` and `use_list` ok?
-            return ret if self._use_list else tuple(ret)
-        if typ == TYPE_MAP:
-            if execute == EX_SKIP:
-                for i in range(n):
-                    # TODO check whether we need to call hooks
-                    self._unpack(EX_SKIP)
-                    self._unpack(EX_SKIP)
-                return
-            if self._object_pairs_hook is not None:
-                # Pass a list, as the C extension does, so the whole map is
-                # consumed even if the hook does not iterate it.
-                pairs = []
-                for _ in range(n):
-                    key = self._unpack(EX_CONSTRUCT)
-                    if self._strict_map_key and type(key) not in (str, bytes):
-                        raise ValueError("%s is not allowed for map key" % str(type(key)))
-                    pairs.append((key, self._unpack(EX_CONSTRUCT)))
-                ret = self._object_pairs_hook(pairs)
-            else:
-                ret = {}
-                for _ in range(n):
-                    key = self._unpack(EX_CONSTRUCT)
-                    if self._strict_map_key and type(key) not in (str, bytes):
-                        raise ValueError("%s is not allowed for map key" % str(type(key)))
-                    if isinstance(key, str):
-                        key = sys.intern(key)
-                    ret[key] = self._unpack(EX_CONSTRUCT)
-                if self._object_hook is not None:
-                    ret = self._object_hook(ret)
-            return ret
-        if execute == EX_SKIP:
-            return
+    def _construct(self, typ, n, obj):
         if typ == TYPE_RAW:
             if self._raw:
-                obj = bytes(obj)
-            else:
-                obj = obj.decode("utf_8", self._unicode_errors)
-            return obj
+                return bytes(obj)
+            return obj.decode("utf_8", self._unicode_errors)
         if typ == TYPE_BIN:
             return bytes(obj)
         if typ == TYPE_EXT:
@@ -577,10 +559,143 @@ class Unpacker:
                     return ts.to_datetime()
                 else:
                     return ts
-            else:
-                return self._ext_hook(n, bytes(obj))
+            return self._ext_hook(n, bytes(obj))
         assert typ == TYPE_IMMEDIATE
         return obj
+
+    def _array_end(self, ret):
+        if self._list_hook is not None:
+            ret = self._list_hook(ret)
+        # TODO is the interaction between `list_hook` and `use_list` ok?
+        return ret if self._use_list else tuple(ret)
+
+    def _new_container(self, typ, n):
+        if typ == TYPE_ARRAY:
+            return newlist_hint(min(n, 10000))
+        if self._object_pairs_hook is not None:
+            return []
+        return {}
+
+    def _map_end(self, ret):
+        if self._object_pairs_hook is not None:
+            return self._object_pairs_hook(ret)
+        if self._object_hook is not None:
+            return self._object_hook(ret)
+        return ret
+
+    def _map_item(self, frame, key, value):
+        if self._object_pairs_hook is not None:
+            frame[3].append((key, value))
+        else:
+            if isinstance(key, str):
+                key = sys.intern(key)
+            frame[3][key] = value
+
+    def _unpack(self, execute=EX_CONSTRUCT):
+        if execute in (EX_READ_ARRAY_HEADER, EX_READ_MAP_HEADER):
+            if self._active_execute is not None and self._active_execute != execute:
+                raise ValueError("Cannot switch unpacking methods while an object is incomplete")
+            # Only lock the method once a header byte is available, as the C
+            # extension does. An incomplete header stays locked, a complete
+            # one unlocks the unpacker like a finished object does.
+            self._reserve(1)
+            self._active_execute = execute
+            try:
+                typ, n, _ = self._read_header()
+                if execute == EX_READ_ARRAY_HEADER and typ != TYPE_ARRAY:
+                    # Leave the object unread, as the C extension does.
+                    self._buff_i = self._buf_checkpoint
+                    raise ValueError("Expected array")
+                if execute == EX_READ_MAP_HEADER and typ != TYPE_MAP:
+                    self._buff_i = self._buf_checkpoint
+                    raise ValueError("Expected map")
+            except OutOfData:
+                raise
+            except BaseException:
+                self._active_execute = None
+                raise
+            self._active_execute = None
+            return n
+
+        construct = execute != EX_SKIP
+        if self._active_execute is not None and self._active_execute != execute:
+            raise ValueError("Cannot switch unpacking methods while an object is incomplete")
+        stack = self._stack
+        # Like the C extension, the operation is only recorded once input is
+        # available, so an unpacker with no data can still use any method.
+        activate = self._active_execute is None
+        try:
+            while True:
+                if activate:
+                    self._reserve(1)
+                    self._active_execute = execute
+                    activate = False
+                typ, n, obj = self._read_header()
+                if construct and typ in (TYPE_RAW, TYPE_BIN, TYPE_EXT, TYPE_IMMEDIATE):
+                    obj = self._construct(typ, n, obj)
+
+                if typ == TYPE_ARRAY or typ == TYPE_MAP:
+                    if len(stack) >= DEFAULT_RECURSE_LIMIT:
+                        raise StackError
+                    if n == 0:
+                        if construct:
+                            if typ == TYPE_ARRAY:
+                                obj = self._array_end(self._new_container(typ, n))
+                            else:
+                                obj = self._map_end(self._new_container(typ, n))
+                        else:
+                            obj = None
+                    else:
+                        container = self._new_container(typ, n) if construct else None
+                        if typ == TYPE_ARRAY:
+                            stack.append([TYPE_ARRAY, n, 0, container])
+                        else:
+                            stack.append([TYPE_MAP, n, 0, container, None, False])
+                        continue
+
+                # `obj` is now a completed value. Give it to the enclosing
+                # container, unwinding containers that become complete.
+                while True:
+                    if not stack:
+                        self._stack = []
+                        self._active_execute = None
+                        return obj if construct else None
+                    frame = stack[-1]
+                    if frame[0] == TYPE_ARRAY:
+                        if construct:
+                            frame[3].append(obj)
+                        frame[2] += 1
+                        if frame[2] < frame[1]:
+                            break
+                        stack.pop()
+                        obj = self._array_end(frame[3]) if construct else None
+                        continue
+                    if not frame[5]:
+                        if construct:
+                            if self._strict_map_key and type(obj) not in (str, bytes):
+                                raise ValueError("%s is not allowed for map key" % str(type(obj)))
+                            frame[4] = obj
+                        frame[5] = True
+                        break
+                    if construct:
+                        self._map_item(frame, frame[4], obj)
+                        frame[4] = None
+                    frame[2] += 1
+                    frame[5] = False
+                    if frame[2] < frame[1]:
+                        break
+                    stack.pop()
+                    obj = self._map_end(frame[3]) if construct else None
+        except OutOfData:
+            # The current token is restarted from `_buf_checkpoint` when more
+            # input arrives; keep the partially built containers.
+            raise
+        except BaseException:
+            # The parser is left in an unsupported state after a real error,
+            # as with the C extension. Drop the partial object.
+            self._stack = []
+            self._active_execute = None
+            raise
 
     def __iter__(self):
         return self
@@ -624,7 +739,7 @@ class Unpacker:
         return ret
 
     def tell(self):
-        return self._stream_offset
+        return self._buffer_start + self._buff_i
 
 
 class Packer:

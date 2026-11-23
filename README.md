@@ -39,7 +39,10 @@ msgpack provides `dumps` and `loads` as aliases for compatibility with
 `json` and `pickle`.
 
 `pack` and `dump` pack to a file-like object.
-`unpack` and `load` unpack from a file-like object.
+`unpack` and `load` unpack one object from a file-like object. The stream is
+read incrementally, so the message does not have to fit in memory as a whole.
+Trailing bytes raise `ExtraData`, which carries the unpacked object and the
+remaining bytes.
 
 ```pycon
 >>> import msgpack

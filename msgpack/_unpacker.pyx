@@ -472,10 +472,26 @@ cdef class Unpacker:
 
         next_bytes = self.file_like_read(min(self.read_size, remains))
         if next_bytes:
-            self.append_buffer(PyBytes_AsString(next_bytes), PyBytes_Size(next_bytes))
+            # A short read is fine; more data is requested when needed. The
+            # returned object only has to be bytes-like.
+            self.append_bytes(next_bytes)
         else:
             self.file_like = None
         return 0
+
+    cdef append_bytes(self, object next_bytes):
+        cdef Py_buffer pybuff
+        cdef char* buf
+        cdef Py_ssize_t buf_len
+        if PyBytes_CheckExact(next_bytes):
+            self.append_buffer(PyBytes_AS_STRING(next_bytes),
+                               PyBytes_GET_SIZE(next_bytes))
+            return
+        get_data_from_buffer(next_bytes, &pybuff, &buf, &buf_len)
+        try:
+            self.append_buffer(buf, buf_len)
+        finally:
+            PyBuffer_Release(&pybuff)
 
     cdef object _unpack(self, execute_fn execute, bint iter=0):
         cdef int ret
@@ -525,6 +541,16 @@ cdef class Unpacker:
                     raise ValueError("Unpack failed: error = %d" % (ret,))
         finally:
             self._unpacking = False
+
+    @cython.critical_section
+    def _get_extradata(self):
+        """Return bytes buffered after the last unpacked object."""
+        if self._unpacking:
+            raise RuntimeError(
+                "Unpacker._get_extradata() cannot be called while unpacking is in progress"
+            )
+        return PyBytes_FromStringAndSize(self.buf + self.buf_head,
+                                         self.buf_tail - self.buf_head)
 
     @cython.critical_section
     def read_bytes(self, Py_ssize_t nbytes):

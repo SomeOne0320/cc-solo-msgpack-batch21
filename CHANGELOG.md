@@ -1,3 +1,17 @@
+# 1.2.5
+
+Release Date: TBD
+
+- `unpack()` now decodes a file-like object incrementally instead of calling
+  `read()` without a size limit and passing the whole message to `unpackb()`.
+  Only `read(n)` is used, short reads are supported, and `seek()`/`tell()`/file
+  size are not required. Previously the entire message and the decoded object
+  were held in memory at the same time; now only a bounded read buffer is kept
+  alongside the result. `ExtraData` still carries the decoded object and all
+  trailing bytes. The pure Python unpacker also releases input as it is
+  consumed when reading from a file-like object.
+
+
 # 1.2.4
 
 Release Date: 2026-10-27

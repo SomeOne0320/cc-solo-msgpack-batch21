@@ -326,6 +326,12 @@ cdef class Unpacker:
     cdef Py_ssize_t max_buffer_size
     cdef uint64_t stream_offset
     cdef bint _unpacking
+    # Bytes of an in-progress record already consumed from buf, archived so
+    # that unpack_with_bytes() can return the exact input bytes of a record
+    # even when it is read through multiple feed()/read() rounds.
+    cdef object raw_buf
+    # Raw bytes of the record completed by the last _unpack(want_raw=1).
+    cdef object last_raw
 
     def __dealloc__(self):
         unpack_clear(&self.ctx)
@@ -393,6 +399,8 @@ cdef class Unpacker:
         self.buf_tail = 0
         self.stream_offset = 0
         self._unpacking = False
+        self.raw_buf = bytearray()
+        self.last_raw = None
 
         if unicode_errors is not None:
             self.unicode_errors = unicode_errors
@@ -477,10 +485,11 @@ cdef class Unpacker:
             self.file_like = None
         return 0
 
-    cdef object _unpack(self, execute_fn execute, bint iter=0):
+    cdef object _unpack(self, execute_fn execute, bint iter=0, bint want_raw=0):
         cdef int ret
         cdef object obj
         cdef Py_ssize_t prev_head
+        cdef bint fresh
 
         if self._unpacking:
             raise RuntimeError("Unpacker cannot be called recursively while unpacking is in progress")
@@ -491,12 +500,14 @@ cdef class Unpacker:
         try:
             while 1:
                 prev_head = self.buf_head
+                fresh = self.ctx.execute == NULL
                 if prev_head < self.buf_tail:
                     self.ctx.execute = execute
                     try:
                         ret = execute(&self.ctx, self.buf, self.buf_tail, &self.buf_head)
                     except:
                         unpack_clear(&self.ctx)
+                        self.raw_buf = bytearray()
                         raise
                     finally:
                         self.stream_offset += self.buf_head - prev_head
@@ -504,10 +515,31 @@ cdef class Unpacker:
                     ret = 0
 
                 if ret == 1:
+                    if execute == unpack_construct:
+                        if fresh:
+                            # The whole record was read in this run: its
+                            # bytes are still in the buffer.
+                            if want_raw:
+                                self.last_raw = PyBytes_FromStringAndSize(
+                                    self.buf + prev_head, self.buf_head - prev_head)
+                        else:
+                            # The record was read through several runs: its
+                            # first bytes were archived in raw_buf.
+                            if want_raw:
+                                self.raw_buf += PyBytes_FromStringAndSize(
+                                    self.buf + prev_head, self.buf_head - prev_head)
+                                self.last_raw = bytes(self.raw_buf)
+                            self.raw_buf = bytearray()
                     obj = unpack_take_result(&self.ctx)
                     unpack_init(&self.ctx)
                     return obj
                 if ret == 0:
+                    if execute == unpack_construct and self.buf_head > prev_head:
+                        # Archive the consumed part of an incomplete record:
+                        # append_buffer() may drop it from the buffer before
+                        # the record is completed by a later call.
+                        self.raw_buf += PyBytes_FromStringAndSize(
+                            self.buf + prev_head, self.buf_head - prev_head)
                     if self.file_like is not None:
                         self.read_from_file()
                         continue
@@ -517,6 +549,7 @@ cdef class Unpacker:
                         raise OutOfData("No more data to unpack.")
 
                 unpack_clear(&self.ctx)
+                self.raw_buf = bytearray()
                 if ret == -2:
                     raise FormatError
                 elif ret == -3:
@@ -552,6 +585,31 @@ cdef class Unpacker:
         Raises `OutOfData` when there are no more bytes to unpack.
         """
         return self._unpack(unpack_construct)
+
+    @cython.critical_section
+    def unpack_with_bytes(self, callback=None):
+        """Unpack one object and return it together with its raw bytes.
+
+        Returns a ``(object, raw_bytes)`` tuple. *raw_bytes* is the exact
+        slice of the input that produced *object*, so it preserves the
+        original representation of the record: integer widths, map key
+        order and duplicate keys are kept as they were read.
+
+        When *callback* is given, it is called as ``callback(obj, raw)``
+        once the whole record has been read -- exactly once per record,
+        and not at all while the record is incomplete.
+
+        Raises `OutOfData` when there are no more bytes to unpack.
+        Feed more data and call again to receive the same record; the
+        following record is left for the next call.
+        """
+        self.last_raw = None
+        obj = self._unpack(unpack_construct, 0, 1)
+        raw = self.last_raw
+        self.last_raw = None
+        if callback is not None:
+            callback(obj, raw)
+        return obj, raw
 
     @cython.critical_section
     def skip(self):

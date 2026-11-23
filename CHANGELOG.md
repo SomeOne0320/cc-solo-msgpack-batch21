@@ -1,3 +1,13 @@
+# Unreleased
+
+- Add `Unpacker.unpack_with_bytes()`, which unpacks one object and returns it
+  together with the exact input bytes of that record. The raw bytes preserve
+  the original representation (integer widths, map key order and duplicate
+  keys), so records can be archived as read while the decoded object is used
+  for validation. An optional callback is invoked exactly once per record,
+  only when the record has been fully read.
+
+
 # 1.2.4
 
 Release Date: 2026-10-27

@@ -613,6 +613,40 @@ class Unpacker:
         self._consume()
         return ret
 
+    def unpack_with_bytes(self, callback=None):
+        """Unpack one object and return it together with its raw bytes.
+
+        Returns a ``(object, raw_bytes)`` tuple.  *raw_bytes* is the exact
+        slice of the input that produced *object*, so it preserves the
+        original representation of the record: integer widths, map key
+        order and duplicate keys are kept as they were read.
+
+        When *callback* is given, it is called as ``callback(obj, raw)``
+        once the whole record has been read -- exactly once per record,
+        and not at all while the record is incomplete.
+
+        Raises ``OutOfData`` when the buffer holds only a part of the next
+        record.  Feed more data and call again to receive the same record;
+        the following record is left for the next call.
+        """
+        self._consume()
+        # Drop the consumed prefix so the record's start index stays valid
+        # even when _reserve() compacts the buffer while reading file_like.
+        if self._buf_checkpoint > 0:
+            del self._buffer[: self._buf_checkpoint]
+            self._buff_i -= self._buf_checkpoint
+            self._buf_checkpoint = 0
+        start = self._buff_i
+        try:
+            ret = self._unpack(EX_CONSTRUCT)
+        except RecursionError:
+            raise StackError
+        raw = bytes(self._buffer[start : self._buff_i])
+        self._consume()
+        if callback is not None:
+            callback(ret, raw)
+        return ret, raw
+
     def read_array_header(self):
         ret = self._unpack(EX_READ_ARRAY_HEADER)
         self._consume()

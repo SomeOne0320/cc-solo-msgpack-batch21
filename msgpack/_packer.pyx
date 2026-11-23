@@ -128,6 +128,15 @@ cdef class Packer:
         if self.exports > 0:
             raise BufferError("Existing exports of data: Packer cannot be changed")
 
+    cdef inline void _rollback(self, size_t start):
+        # Undo everything appended by the failed public call.  With autoreset
+        # the buffer must be empty for the next call's return value, so a
+        # partially written object is never handed out.
+        if self.autoreset:
+            self.pk.length = 0
+        else:
+            self.pk.length = start
+
     @cython.critical_section
     def __init__(self, *, default=None,
                  bint use_single_float=False, bint autoreset=True, bint use_bin_type=True,
@@ -272,13 +281,16 @@ cdef class Packer:
     @cython.critical_section
     def pack(self, object obj):
         cdef int ret
+        cdef size_t start
         self._check_exports()
+        start = self.pk.length
         try:
             ret = self._pack(obj, DEFAULT_RECURSE_LIMIT)
         except:
-            self.pk.length = 0
+            self._rollback(start)
             raise
         if ret:  # should not happen.
+            self._rollback(start)
             raise RuntimeError("internal error")
         if self.autoreset:
             buf = PyBytes_FromStringAndSize(self.pk.buf, self.pk.length)
@@ -287,11 +299,17 @@ cdef class Packer:
 
     @cython.critical_section
     def pack_ext_type(self, typecode, data):
+        cdef size_t start
         self._check_exports()
-        if len(data) > ITEM_LIMIT:
-            raise ValueError("ext data too large")
-        msgpack_pack_ext(&self.pk, typecode, len(data))
-        msgpack_pack_raw_body(&self.pk, data, len(data))
+        start = self.pk.length
+        try:
+            if len(data) > ITEM_LIMIT:
+                raise ValueError("ext data too large")
+            msgpack_pack_ext(&self.pk, typecode, len(data))
+            msgpack_pack_raw_body(&self.pk, data, len(data))
+        except:
+            self._rollback(start)
+            raise
         if self.autoreset:
             buf = PyBytes_FromStringAndSize(self.pk.buf, self.pk.length)
             self.pk.length = 0
@@ -299,12 +317,18 @@ cdef class Packer:
 
     @cython.critical_section
     def pack_array_header(self, long long size):
+        cdef size_t start
         self._check_exports()
-        if size < 0:
-            raise ValueError("array size must be non-negative")
-        if size > ITEM_LIMIT:
-            raise ValueError("array too large")
-        msgpack_pack_array(&self.pk, size)
+        start = self.pk.length
+        try:
+            if size < 0:
+                raise ValueError("array size must be non-negative")
+            if size > ITEM_LIMIT:
+                raise ValueError("array too large")
+            msgpack_pack_array(&self.pk, size)
+        except:
+            self._rollback(start)
+            raise
         if self.autoreset:
             buf = PyBytes_FromStringAndSize(self.pk.buf, self.pk.length)
             self.pk.length = 0
@@ -312,12 +336,18 @@ cdef class Packer:
 
     @cython.critical_section
     def pack_map_header(self, long long size):
+        cdef size_t start
         self._check_exports()
-        if size < 0:
-            raise ValueError("map size must be non-negative")
-        if size > ITEM_LIMIT:
-            raise ValueError("map too learge")
-        msgpack_pack_map(&self.pk, size)
+        start = self.pk.length
+        try:
+            if size < 0:
+                raise ValueError("map size must be non-negative")
+            if size > ITEM_LIMIT:
+                raise ValueError("map too learge")
+            msgpack_pack_map(&self.pk, size)
+        except:
+            self._rollback(start)
+            raise
         if self.autoreset:
             buf = PyBytes_FromStringAndSize(self.pk.buf, self.pk.length)
             self.pk.length = 0
@@ -331,14 +361,20 @@ cdef class Packer:
         *pairs* should be a sequence of pairs.
         (`len(pairs)` and `for k, v in pairs:` should be supported.)
         """
+        cdef size_t start
         self._check_exports()
-        size = len(pairs)
-        if size > ITEM_LIMIT:
-            raise ValueError("map too large")
-        msgpack_pack_map(&self.pk, size)
-        for k, v in pairs:
-            self._pack(k)
-            self._pack(v)
+        start = self.pk.length
+        try:
+            size = len(pairs)
+            if size > ITEM_LIMIT:
+                raise ValueError("map too large")
+            msgpack_pack_map(&self.pk, size)
+            for k, v in pairs:
+                self._pack(k)
+                self._pack(v)
+        except:
+            self._rollback(start)
+            raise
         if self.autoreset:
             buf = PyBytes_FromStringAndSize(self.pk.buf, self.pk.length)
             self.pk.length = 0

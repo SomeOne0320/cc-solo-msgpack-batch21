@@ -7,6 +7,7 @@ from io import BytesIO
 
 import pytest
 
+import msgpack
 from msgpack import Packer, Unpacker, packb, unpackb
 
 
@@ -220,3 +221,83 @@ def test_buf_size_is_converted_once():
     buf_size = Counting()
     Packer(buf_size=buf_size)
     assert buf_size.count == 1
+
+
+class Unpackable:
+    """An object that can not be serialized and is not handled by default."""
+
+
+def unpack_all(packed):
+    unpacker = Unpacker(raw=False, strict_map_key=False)
+    unpacker.feed(packed)
+    return list(unpacker)
+
+
+def test_failed_pack_keeps_earlier_messages():
+    packer = Packer(autoreset=False)
+    packer.pack(1)
+    with pytest.raises(TypeError):
+        packer.pack([1, Unpackable()])
+    # Only this call's partial object is undone; the earlier message survives.
+    assert packer.bytes() == packb(1)
+    packer.pack(2)
+    assert unpack_all(packer.bytes()) == [1, 2]
+
+
+def test_failed_pack_autoreset_returns_no_partial_message():
+    packer = Packer()
+    assert packer.pack(1) == packb(1)
+    with pytest.raises(TypeError):
+        packer.pack([1, Unpackable()])
+    assert packer.bytes() == b""
+    assert packer.pack(2) == packb(2)
+
+
+def test_failed_pack_pairs_rolls_back_whole_map():
+    packer = Packer(autoreset=False)
+    packer.pack("before")
+    with pytest.raises(TypeError):
+        packer.pack_map_pairs([("a", 1), ("b", Unpackable())])
+    # The map header and the first pair must not be left behind.
+    assert packer.bytes() == packb("before")
+    packer.pack_map_pairs([("a", 1)])
+    assert unpack_all(packer.bytes()) == ["before", {"a": 1}]
+
+
+def test_failed_pack_map_pairs_autoreset():
+    packer = Packer()
+    with pytest.raises(TypeError):
+        packer.pack_map_pairs([("a", Unpackable())])
+    assert packer.bytes() == b""
+    assert unpackb(packer.pack_map_pairs([("a", 1)])) == {"a": 1}
+
+
+def test_failed_header_and_ext_calls_roll_back():
+    packer = Packer(autoreset=False)
+    packer.pack("keep")
+    with pytest.raises(ValueError):
+        packer.pack_array_header(-1)
+    with pytest.raises(ValueError):
+        packer.pack_map_header(-1)
+    if Packer.__module__ == "msgpack.fallback":
+        with pytest.raises(TypeError):
+            packer.pack_ext_type(1, "not bytes")
+    assert packer.bytes() == packb("keep")
+    packer.pack_ext_type(0x42, b"A")
+    assert unpack_all(packer.bytes()) == ["keep", msgpack.ExtType(0x42, b"A")]
+
+
+def test_failed_pack_preserves_default_error():
+    class CustomError(Exception):
+        pass
+
+    def default(obj):
+        raise CustomError("from default")
+
+    packer = Packer(autoreset=False, default=default)
+    packer.pack(1)
+    with pytest.raises(CustomError, match="from default"):
+        packer.pack(Unpackable())
+    assert packer.bytes() == packb(1)
+    packer.pack(2)
+    assert unpack_all(packer.bytes()) == [1, 2]

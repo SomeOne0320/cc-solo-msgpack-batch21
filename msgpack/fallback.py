@@ -17,6 +17,7 @@ if hasattr(sys, "pypy_version_info"):
                 self.builder.append(s)
             else:
                 self.builder = BytesBuilder()
+            self._length = len(s)
 
         def write(self, s):
             if isinstance(s, memoryview):
@@ -24,9 +25,13 @@ if hasattr(sys, "pypy_version_info"):
             elif isinstance(s, bytearray):
                 s = bytes(s)
             self.builder.append(s)
+            self._length += len(s)
 
         def getvalue(self):
             return self.builder.build()
+
+        def tell(self):
+            return self._length
 
 else:
     from io import BytesIO
@@ -699,6 +704,32 @@ class Packer:
             raise TypeError("default must be callable")
         self._default = default
 
+    def _buf_length(self):
+        """Return the number of bytes currently in the buffer."""
+        return self._buffer.tell()
+
+    def _rollback(self, start):
+        """Undo everything appended to the buffer after *start*.
+
+        With autoreset the buffer must be empty for the next call's return
+        value, so a partially written object is never handed out.
+        """
+        if self._autoreset:
+            start = 0
+        if self._buf_length() == start:
+            return
+        if start == 0:
+            self._buffer = BytesIO()
+            return
+        try:
+            self._buffer.seek(start)
+            self._buffer.truncate(start)
+        except (AttributeError, OSError, ValueError, BufferError):
+            # PyPy's BytesBuilder-based BytesIO has no seek()/truncate(), and
+            # an exported memoryview makes the buffer un-resizable.  Replacing
+            # the buffer also guarantees that no partial message survives.
+            self._buffer = BytesIO(self._buffer.getvalue()[:start])
+
     def _pack(
         self,
         obj,
@@ -825,10 +856,11 @@ class Packer:
             raise TypeError(f"Cannot serialize {obj!r}")
 
     def pack(self, obj):
+        start = self._buf_length()
         try:
             self._pack(obj)
         except:
-            self._buffer = BytesIO()  # force reset
+            self._rollback(start)
             raise
         if self._autoreset:
             ret = self._buffer.getvalue()
@@ -836,35 +868,62 @@ class Packer:
             return ret
 
     def pack_map_pairs(self, pairs):
-        self._pack_map_pairs(len(pairs), pairs)
+        start = self._buf_length()
+        try:
+            self._pack_map_pairs(len(pairs), pairs)
+        except:
+            self._rollback(start)
+            raise
         if self._autoreset:
             ret = self._buffer.getvalue()
             self._buffer = BytesIO()
             return ret
 
     def pack_array_header(self, n):
-        if n < 0:
-            raise ValueError("array size must be non-negative")
-        if n >= 2**32:
-            raise ValueError
-        self._pack_array_header(n)
+        start = self._buf_length()
+        try:
+            if n < 0:
+                raise ValueError("array size must be non-negative")
+            if n >= 2**32:
+                raise ValueError
+            self._pack_array_header(n)
+        except:
+            self._rollback(start)
+            raise
         if self._autoreset:
             ret = self._buffer.getvalue()
             self._buffer = BytesIO()
             return ret
 
     def pack_map_header(self, n):
-        if n < 0:
-            raise ValueError("map size must be non-negative")
-        if n >= 2**32:
-            raise ValueError
-        self._pack_map_header(n)
+        start = self._buf_length()
+        try:
+            if n < 0:
+                raise ValueError("map size must be non-negative")
+            if n >= 2**32:
+                raise ValueError
+            self._pack_map_header(n)
+        except:
+            self._rollback(start)
+            raise
         if self._autoreset:
             ret = self._buffer.getvalue()
             self._buffer = BytesIO()
             return ret
 
     def pack_ext_type(self, typecode, data):
+        start = self._buf_length()
+        try:
+            self._pack_ext_type(typecode, data)
+        except:
+            self._rollback(start)
+            raise
+        if self._autoreset:
+            ret = self._buffer.getvalue()
+            self._buffer = BytesIO()
+            return ret
+
+    def _pack_ext_type(self, typecode, data):
         if not isinstance(typecode, int):
             raise TypeError("typecode must have int type.")
         if not 0 <= typecode <= 127:
@@ -892,10 +951,6 @@ class Packer:
             self._buffer.write(b"\xc9" + struct.pack(">I", L))
         self._buffer.write(struct.pack("B", typecode))
         self._buffer.write(data)
-        if self._autoreset:
-            ret = self._buffer.getvalue()
-            self._buffer = BytesIO()
-            return ret
 
     def _pack_array_header(self, n):
         if n <= 0x0F:
